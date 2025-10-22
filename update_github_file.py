@@ -2,7 +2,7 @@ import os
 import re
 import time as pytime
 import requests
-from datetime import datetime, date, time as dt_time, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from github import Github, GithubException
 
 # ==========================
@@ -10,7 +10,7 @@ from github import Github, GithubException
 # ==========================
 GITHUB_TOKEN = os.getenv('GITHUB_PAT')  # Ambil dari environment variable
 
-# Gunakan pola raw yang valid: https://raw.githubusercontent.com/<user>/<repo>/<branch>/<path>
+# Sumber konten (tanpa footer). Kita akan tambahkan footer sendiri.
 SOURCE_URL   = "https://raw.githubusercontent.com/uppermoon77/dadangconelo/main/dadangconelo"
 
 # REPO tujuan (Format: "username/repository")
@@ -19,21 +19,22 @@ GIT_BRANCH   = "main"
 COMMIT_MSG   = "Auto update: Sync playlist from source + footer update"
 SLEEP_BETWEEN_COMMITS_SEC = 0.7
 
-# Mode: Expiry berdasarkan NAMA REPOSITORY
-USE_REPO_NAME_EXPIRY = True
+# Mode expired per FILE NAME (bukan per repo)
 EXPIRE_HOUR_LOCAL = 13    # 13:00 WIB
 EXPIRE_MINUTE_LOCAL = 0
 
-# Saat expired, kita tulis marker ini supaya run berikutnya tahu sinkron sudah dimatikan
+# Saat expired (global), kita bisa tulis marker ini (opsional)
 SYNC_DISABLED_MARKER = ".SYNC_DISABLED"
+HONOR_MARKER_EVEN_BEFORE_EXPIRY = False  # set True jika ingin hormati marker walau belum expired
 
-# TARGET FILES (contoh November 2025). Kamu bisa ganti generator ini sesuai kebutuhan.
+# TARGET FILES (contoh Oktober 2025). Silakan ganti sesuai kebutuhan.
 def generate_target_files() -> list[str]:
     month = "OKTOBER"
     year = "2025"
     prefix = "DC"
-    # CD01OKTOBER2025 ... CD31OKTOBER2025
-    return [f"{prefix}{day:02d}{month}{year}" for day in range(1, 31)]
+    # DC01OKTOBER2025 ... DC31OKTOBER2025
+    # Catatan: Oktober 2025 punya 31 hari
+    return [f"{prefix}{day:02d}{month}{year}" for day in range(1, 32)]
 
 # ==========================
 # UTIL TANGGAL & WIB
@@ -43,39 +44,29 @@ JAKARTA_TZ = timezone(timedelta(hours=7))
 def now_jakarta() -> datetime:
     return datetime.now(tz=JAKARTA_TZ)
 
-def today_jakarta() -> date:
-    return now_jakarta().date()
-
 def expiry_cutoff(dt: date) -> datetime:
     """Expire pada Hari-H pukul EXPIRE_HOUR_LOCAL:EXPIRE_MINUTE_LOCAL WIB."""
     return datetime(dt.year, dt.month, dt.day, EXPIRE_HOUR_LOCAL, EXPIRE_MINUTE_LOCAL, tzinfo=JAKARTA_TZ)
 
 # ==========================
-# PARSER TANGGAL DARI NAMA REPO
+# PARSER TANGGAL DARI NAMA (FILE)
 # ==========================
-# Dukungan nama bulan Indonesia
 ID_MONTHS = {
     "JANUARI": 1, "FEBRUARI": 2, "MARET": 3, "APRIL": 4, "MEI": 5, "JUNI": 6,
     "JULI": 7, "AGUSTUS": 8, "SEPTEMBER": 9, "OKTOBER": 10, "NOVEMBER": 11, "DESEMBER": 12
 }
 
-def extract_repo_name(full_repo: str) -> str:
-    """Ambil bagian <repo> dari 'user/repo'."""
-    if "/" in full_repo:
-        return full_repo.split("/", 1)[1]
-    return full_repo
-
-def parse_date_from_repo_name(repo_name: str) -> date | None:
+def parse_date_from_name(name: str) -> date | None:
     """
-    Coba berbagai pola tanggal di nama repository:
-    1) DC21NOVEMBER2025 / 21NOVEMBER2025 / 021NOVEMBER2025 (intinya <dd><BULAN_ID><yyyy>)
+    Coba berbagai pola tanggal di NAMA FILE:
+    1) DC21NOVEMBER2025 / 21NOVEMBER2025 (DD<BULAN_ID>YYYY) -- case-insensitive
     2) 21-11-2025 | 21_11_2025 | 21.11.2025 | 21/11/2025
-    3) 2025-11-21 | 2025_11_21 | 20251121 | 21112025
-    Tidak case sensitive untuk bulan.
+    3) 2025-11-21 | 2025_11_21
+    4) 8 digit rapat: YYYYMMDD atau DDMMYYYY
     """
-    name = repo_name.upper()
+    name = name.upper()
 
-    # Pola 1: <optional prefix>DD<BULAN_ID>YYYY (contoh: CD21NOVEMBER2025 / 21NOVEMBER2025)
+    # Pola 1: <optional prefix>DD<BULAN_ID>YYYY (contoh: DC21NOVEMBER2025 / 21NOVEMBER2025)
     m = re.search(r'(\d{1,2})(JANUARI|FEBRUARI|MARET|APRIL|MEI|JUNI|JULI|AGUSTUS|SEPTEMBER|OKTOBER|NOVEMBER|DESEMBER)(\d{4})', name, re.IGNORECASE)
     if m:
         dd = int(m.group(1))
@@ -86,7 +77,7 @@ def parse_date_from_repo_name(repo_name: str) -> date | None:
         except ValueError:
             pass
 
-    # Pola 2: DD[-_./]MM[-_./]YYYY (21-11-2025, 21_11_2025, 21.11.2025, 21/11/2025)
+    # Pola 2: DD[-_./]MM[-_./]YYYY
     m = re.search(r'(\d{1,2})[-_./](\d{1,2})[-_./](\d{4})', name)
     if m:
         dd = int(m.group(1)); mm = int(m.group(2)); yyyy = int(m.group(3))
@@ -95,7 +86,7 @@ def parse_date_from_repo_name(repo_name: str) -> date | None:
         except ValueError:
             pass
 
-    # Pola 3a: YYYY[-_./]MM[-_./]DD
+    # Pola 3: YYYY[-_./]MM[-_./]DD
     m = re.search(r'(\d{4})[-_./](\d{1,2})[-_./](\d{1,2})', name)
     if m:
         yyyy = int(m.group(1)); mm = int(m.group(2)); dd = int(m.group(3))
@@ -104,7 +95,7 @@ def parse_date_from_repo_name(repo_name: str) -> date | None:
         except ValueError:
             pass
 
-    # Pola 3b: 8 digit rapat: YYYYMMDD atau DDMMYYYY
+    # Pola 4: 8 digit rapat
     m = re.search(r'(\d{8})', name)
     if m:
         digits = m.group(1)
@@ -123,24 +114,25 @@ def parse_date_from_repo_name(repo_name: str) -> date | None:
 
     return None
 
-def is_expired_by_repo_name(full_repo: str) -> bool:
-    """True jika sekarang (WIB) >= Hari-H 13:00, berdasar tanggal yang ditemukan di nama repo."""
-    if not USE_REPO_NAME_EXPIRY:
-        return False
-    repo_name = extract_repo_name(full_repo)
-    dt = parse_date_from_repo_name(repo_name)
+def is_expired_by_name(name: str) -> bool:
+    """
+    True jika sekarang (WIB) >= Hari-H 13:00, berdasar tanggal yang ditemukan di NAMA FILE.
+    Contoh nama: DC21OKTOBER2025 → expired mulai 21-10-2025 13:00 WIB.
+    """
+    dt = parse_date_from_name(name)
     if not dt:
-        print(f"⚠️  Tidak menemukan tanggal di nama repo '{repo_name}'. Lewati expiry berbasis repo.")
+        print(f"⚠️  Tidak menemukan tanggal di nama '{name}'. Lewati expiry per-file.")
         return False
     cutoff = expiry_cutoff(dt)
     now_ = now_jakarta()
-    print(f"ℹ️  Repo date = {dt.isoformat()} | Cutoff = {cutoff.isoformat()} | Now = {now_.isoformat()}")
+    print(f"ℹ️  File date = {dt.isoformat()} | Cutoff = {cutoff.isoformat()} | Now = {now_.isoformat()}")
     return now_ >= cutoff
 
 # ==========================
 # FOOTER & TEMPLATE
 # ==========================
-FOOTER_REGEX = r'#EXTM3U billed-msg="[^"]+"'
+# Buang baris footer yang lama (kalau ada), agar tidak dobel.
+FOOTER_REGEX = r'(?mi)^\s*#EXTM3U\s+billed-msg="[^"]+"\s*$'
 
 def generate_footer(dest_file_path: str, expired: bool) -> str:
     if expired:
@@ -156,7 +148,8 @@ def add_footer(text: str, dest_file_path: str, expired: bool) -> str:
 
 def build_expired_playlist_block() -> str:
     """
-    Blok 'MASA BERLAKU HABIS' (sesuai contohmu).
+    Blok 'MASA BERLAKU HABIS' sesuai kebutuhan.
+    (Typo .jpegg diperbaiki ke .jpeg)
     """
     return (
         '#EXTINF:-1 group-logo="https://i.imgur.com/aVBedkE.jpeg",🔰 MAGELIFE OFFICIAL\n\n'
@@ -171,19 +164,19 @@ def build_expired_playlist_block() -> str:
         '#EXTINF:-1 group-logo="https://i.imgur.com/XXQ2pQ3.jpeg", ❌ MASA BERLAKU HABIS TANTE\n\n'
         '#EXTINF:-1 tvg-id="Iheart80s" tvg-name="Iheart80s" tvg-logo="https://i.imgur.com/XXQ2pQ3.jpeg" group-title="❌ MASA BERLAKU HABIS TANTE", MASA BERLAKU HABIS\n'
         'https://iheart-iheart80s-1-us.roku.wurl.tv/playlist.m3u8\n\n'
-        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpegg", ✅ SILAHKAN RE ORDER\n\n'
+        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpeg", ✅ SILAHKAN RE ORDER\n\n'
         '#EXTINF:-1 tvg-id="Iheart80s" tvg-name="Iheart80s" tvg-logo="https://i.imgur.com/bjfYe6g.jpeg" group-title="✅ SILAHKAN RE ORDER", SILAHKAN RE ORDER\n'
         'https://iheart-iheart80s-1-us.roku.wurl.tv/playlist.m3u8\n\n'
-        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpegg", ✅SILAHKAN RE ORDER OM\n\n'
+        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpeg", ✅SILAHKAN RE ORDER OM\n\n'
         '#EXTINF:-1 tvg-id="Iheart80s" tvg-name="Iheart80s" tvg-logo="https://i.imgur.com/bjfYe6g.jpeg" group-title="✅ SILAHKAN RE ORDER OM", SILAHKAN RE ORDER\n'
         'https://iheart-iheart80s-1-us.roku.wurl.tv/playlist.m3u8\n\n'
-        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpegg", ✅SILAHKAN RE ORDER TANTE\n\n'
+        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpeg", ✅SILAHKAN RE ORDER TANTE\n\n'
         '#EXTINF:-1 tvg-id="Iheart80s" tvg-name="Iheart80s" tvg-logo="https://i.imgur.com/bjfYe6g.jpeg" group-title="✅ SILAHKAN RE ORDER TANTE", SILAHKAN RE ORDER\n'
         'https://iheart-iheart80s-1-us.roku.wurl.tv/playlist.m3u8\n\n'
-        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpegg", 📲 Wa 082219213334\n\n'
+        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpeg", 📲 Wa 082219213334\n\n'
         '#EXTINF:-1 tvg-id="Iheart80s" tvg-name="Iheart80s" tvg-logo="https://i.imgur.com/bjfYe6g.jpeg" group-title="📲 Wa 082219213334", SILAHKAN RE ORDER\n'
         'https://iheart-iheart80s-1-us.roku.wurl.tv/playlist.m3u8\n\n'
-        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpegg", 📲 Wa 082219213334 order\n\n'
+        '#EXTINF:-1 group-logo="https://i.imgur.com/bjfYe6g.jpeg", 📲 Wa 082219213334 order\n\n'
         '#EXTINF:-1 tvg-id="Iheart80s" tvg-name="Iheart80s" tvg-logo="https://i.imgur.com/bjfYe6g.jpeg" group-title="📲 Wa 082219213334 order", SILAHKAN RE ORDER\n'
         'https://iheart-iheart80s-1-us.roku.wurl.tv/playlist.m3u8\n\n'
         '#EXTINF:-1 group-logo="https://i.imgur.com/PJ9tRpK.jpeg",✅ ORDER LYNK\n\n'
@@ -218,12 +211,8 @@ def get_source_content() -> str | None:
 # ==========================
 # GITHUB HELPER
 # ==========================
-def ensure_marker(repo, expired_now: bool):
-    """
-    Jika expired, pastikan marker .SYNC_DISABLED ada (menandakan sinkron dimatikan).
-    """
-    if not expired_now:
-        return
+def ensure_marker(repo):
+    """Buat marker global kalau ingin mengunci sync (opsional)."""
     try:
         repo.get_contents(SYNC_DISABLED_MARKER, ref=GIT_BRANCH)
         print(f"ℹ️  Marker {SYNC_DISABLED_MARKER} sudah ada.")
@@ -232,8 +221,8 @@ def ensure_marker(repo, expired_now: bool):
             print(f"📝 Membuat marker {SYNC_DISABLED_MARKER} ...")
             repo.create_file(
                 path=SYNC_DISABLED_MARKER,
-                message="Mark: sync disabled due to expiry",
-                content=f"Expired at {now_jakarta().isoformat()} WIB\n",
+                message="Mark: sync disabled (manual/opsional)",
+                content=f"Marked at {now_jakarta().isoformat()} WIB\n",
                 branch=GIT_BRANCH
             )
             print("✅ Marker dibuat.")
@@ -244,17 +233,19 @@ def repo_has_marker(repo) -> bool:
     try:
         repo.get_contents(SYNC_DISABLED_MARKER, ref=GIT_BRANCH)
         return True
-    except GithubException as e:
+    except GithubException:
         return False
 
 # ==========================
 # UPDATE FILE PER ITEM
 # ==========================
-def update_single_file(g: Github, dest_file_path: str, base_content_no_footer: str, expired_now: bool) -> None:
+def update_single_file(g: Github, dest_file_path: str, base_content_no_footer: str, force_expired: bool | None = None) -> None:
     """
-    expired_now: jika True, paksa tulis konten expired & JANGAN ambil/bandingkan ke sumber normal.
+    force_expired: paksa expired (True) / paksa aktif (False) / None = auto by file name
     """
     repo = g.get_repo(DEST_REPO)
+    expired_now = is_expired_by_name(dest_file_path) if force_expired is None else force_expired
+
     content_body = build_expired_playlist_block() if expired_now else base_content_no_footer
     new_content_with_footer = add_footer(content_body, dest_file_path, expired_now)
 
@@ -271,7 +262,6 @@ def update_single_file(g: Github, dest_file_path: str, base_content_no_footer: s
             print("➡️  Tidak ada perubahan, skip.")
             return
 
-        # Update file jika ada perubahan
         print("✏️  Ada perubahan, memperbarui file...")
         repo.update_file(
             path=contents.path,
@@ -308,38 +298,27 @@ def main():
     g = Github(GITHUB_TOKEN)
     repo = g.get_repo(DEST_REPO)
 
-    # 1) Tentukan apakah SUDAH EXPIRED berdasar nama repository + cutoff 13:00 WIB
-    expired_now = is_expired_by_repo_name(DEST_REPO)
-
-    # 2) Jika expired, jangan sinkron dari sumber (matikan auto sync) + buat marker
-    if expired_now:
-        print("⛔ Repo sudah EXPIRED per nama repository (mode 13:00 WIB). Auto sync dimatikan.")
-        ensure_marker(repo, expired_now=True)
-        base_no_footer = ""  # tidak dipakai saat expired
+    # Opsional: hormati marker global?
+    if HONOR_MARKER_EVEN_BEFORE_EXPIRY and repo_has_marker(repo):
+        print(f"⛔ Ditemukan marker {SYNC_DISABLED_MARKER}. Auto sync dimatikan untuk semua file.")
+        force_expired = True
+        base_no_footer = ""
     else:
-        # Kalau belum expired namun marker sudah ada, hormati marker = jangan sync lagi (opsional).
-        # Jika kamu ingin mengabaikan marker saat belum expired, set honor_marker = False
-        honor_marker = True
-        if honor_marker and repo_has_marker(repo):
-            print(f"⛔ Ditemukan marker {SYNC_DISABLED_MARKER}. Auto sync tetap dimatikan walau belum lewat tanggal. (Hormat marker)")
-            expired_now = True
-            base_no_footer = ""
-        else:
-            # 3) Ambil konten sumber NORMAL (hanya jika belum expired dan tidak ada marker)
-            src = get_source_content()
-            if src is None:
-                print("❌ Gagal ambil sumber dan belum expired. Stop.")
-                return
-            base_no_footer = strip_footer(src)
+        src = get_source_content()
+        if src is None:
+            print("❌ Gagal ambil sumber. Stop.")
+            return
+        base_no_footer = strip_footer(src)
+        force_expired = None  # auto per-file
 
-    # 4) Proses semua file target
+    # Proses semua file target
     target_files = generate_target_files()
     print(f"\n📁 Daftar file target ({len(target_files)}):")
     print(target_files)
 
     for idx, dest_file_path in enumerate(target_files, start=1):
         print(f"\n({idx}/{len(target_files)}) Mulai update {dest_file_path}...")
-        update_single_file(g, dest_file_path, base_no_footer, expired_now)
+        update_single_file(g, dest_file_path, base_no_footer, force_expired=force_expired)
         pytime.sleep(SLEEP_BETWEEN_COMMITS_SEC)
 
     print("\n🎯 Semua file selesai diproses!")
